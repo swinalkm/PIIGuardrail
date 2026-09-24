@@ -3,21 +3,23 @@ description: Turn the PII Guardrail on or off, or check its status
 argument-hint: "[on|off|detect|status]"
 ---
 
-Run the PII Guardrail control script and show the user its output verbatim.
+Run the PII Guardrail control script and show its output to the user verbatim.
 
-The argument given was: `$ARGUMENTS`
+The user's argument was: `$ARGUMENTS`
 
-Map it to a flag and run exactly one command:
+Pick the flag from that argument — `on` → `--on`, `off` → `--off`,
+`detect` → `--detect`, anything else or empty → `--status` — then run this
+single Bash command, substituting FLAG:
 
-| Argument | Command |
-|---|---|
-| `on` (or empty) | `"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --on` |
-| `off` | `"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --off` |
-| `detect` | `"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --detect` |
-| `status` | `"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --status` |
+```bash
+PG=$(ls -d "$HOME"/.claude/plugins/cache/*/piiguard/*/hooks/run.sh \
+         "$HOME"/.claude/plugins/marketplaces/*/hooks/run.sh 2>/dev/null \
+      | sort -V | tail -1); \
+  [ -n "$PG" ] && sh "$PG" FLAG || echo "PII Guardrail is not installed."
+```
 
-If no argument was given, run `--status` rather than guessing.
+The glob resolves the versioned install path, so do not hardcode a version and
+do not rely on `$CLAUDE_PLUGIN_ROOT` — it is not set in a shell.
 
-Then report the result in one short line — do not re-explain the output, and do
-not offer further changes. The change takes effect on the next prompt; no
+Report the result in one short line. The change applies to the next prompt; no
 restart is needed.

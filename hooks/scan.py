@@ -325,7 +325,19 @@ class Config(object):
 
 
 def _data_dir():
-    return os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.piiguard")
+    """Where secrets.txt, policy.json, the salt and the audit log live.
+
+    Claude Code exports CLAUDE_PLUGIN_DATA to hook processes, but NOT to a
+    normal shell - so the --on/--off CLI has to resolve the same directory
+    itself or it would write config the hook never reads.
+    """
+    d = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if d:
+        return d
+    standard = os.path.expanduser("~/.claude/plugins/data/piiguard-piiguard")
+    if os.path.isdir(standard):
+        return standard
+    return os.path.expanduser("~/.piiguard")
 
 
 def _plugin_root():
