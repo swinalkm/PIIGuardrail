@@ -1,0 +1,12 @@
+{
+  "name": "piiguard",
+  "owner": { "name": "PII Guardrail" },
+  "description": "Keeps protected data out of Claude Code's context.",
+  "plugins": [
+    {
+      "name": "piiguard",
+      "source": ".",
+      "description": "Blocks prompts containing protected data and redacts it from tool output."
+    }
+  ]
+}

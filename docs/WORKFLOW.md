@@ -1,532 +1,416 @@
-# PII Guardrail — Workflow & Architecture
+# PII Guardrail — Architecture
 
-Python. One shared detection core, two thin adapters. Regex + validators only.
-Actions: **redact/tokenize** and **warn-and-log**. PII classes: global standard + secrets/credentials.
+A Claude Code plugin. Scans prompts before they are sent, cleans tool output before the model sees
+it, and asks before a credential is written to disk. Stdlib-only Python, driven by one user-editable
+secrets file.
 
-> Diagrams are Mermaid — they render natively on GitHub and in VS Code
-> (Markdown Preview, or the *Markdown Preview Mermaid Support* extension).
+> Diagrams are Mermaid — they render on GitHub and in VS Code Markdown Preview.
 
 ---
 
-## 1. System overview
+## 1. Scope — what this can and cannot reach
 
-Everything funnels through one scanner. The adapters only know how to find text and what to do with the result.
+The single most important constraint. A Claude Code plugin runs **locally, inside Claude Code**.
+It cannot reach any other Anthropic surface.
 
 ```mermaid
 flowchart TB
-    subgraph SRC["Text entering or leaving the system"]
-        S1["User prompt<br/>Claude Code"]
-        S2["Tool output<br/>Read / Grep / Bash"]
-        S3["Tool input<br/>Bash / Write / Edit"]
-        S4["App request<br/>system + messages"]
-        S5["Model response<br/>buffered or streamed"]
+    subgraph COVERED["Protected by this plugin"]
+        C1["Claude Code — terminal"]
+        C2["Claude Code — VS Code / JetBrains"]
+        C3["Subagents and background tasks"]
     end
 
-    subgraph ADPT["Adapters"]
-        HOOK["adapters/hooks<br/>stdin JSON to stdout JSON"]
-        MID["adapters/api<br/>GuardedAnthropic wrapper"]
+    subgraph UNCOVERED["NOT protected — no local interception point"]
+        U1["claude.ai web UI"]
+        U2["Claude Desktop / mobile"]
+        U3["Anthropic API / your own agents"]
     end
 
-    subgraph CORE["piiguard.core — the only place detection logic lives"]
-        REG["registry.py<br/>Detector protocol"]
-        DET["detectors/<br/>regex + validator pairs"]
-        RES["resolve.py<br/>overlap resolution"]
-        POL["policy.py<br/>per-entity action + allowlists"]
-        RDC["redact.py<br/>apply spans / restore"]
-        VLT["vault.py<br/>placeholder to original<br/>in-memory, session-scoped"]
-        AUD["audit.py<br/>JSONL, hashed only"]
-    end
+    C1 --> HOOK["Plugin hooks run on your machine<br/>before anything is sent"]
+    C2 --> HOOK
+    C3 --> HOOK
+    HOOK --> API["Anthropic API"]
 
-    FUT["Future detectors<br/>Presidio NER / Haiku classifier<br/>slot in at the protocol"]
-
-    S1 --> HOOK
-    S2 --> HOOK
-    S3 --> HOOK
-    S4 --> MID
-    S5 --> MID
-
-    HOOK --> REG
-    MID --> REG
-    REG --> DET
-    DET --> RES
-    RES --> POL
-    POL --> RDC
-    RDC <--> VLT
-    POL --> AUD
-    RDC --> AUD
-    FUT -.implements.-> REG
-
-    RDC --> OUT["Cleaned text<br/>back to the calling adapter"]
+    U1 -->|"browser sends directly<br/>nothing local in between"| API
+    U2 -->|"no plugin mechanism exists"| API
+    U3 -->|"your code calls the API directly"| API
 ```
 
-The `Detector` protocol is the seam. `scan(text) -> Iterable[Span]` is the whole contract, so a
-Presidio or LLM pass can be added later without touching either adapter.
+**Scope is deliberately one surface.** Covering the rest would mean separate products — a browser
+extension for claude.ai, a proxy for the API — and they are not planned. Desktop and mobile have no
+interception point at all short of network-level TLS inspection.
+
+The detector layer is still kept free of Claude Code specifics, but for testability rather than
+future reuse: pure functions with no hook payloads in them are far easier to run against a corpus.
 
 ---
 
-## 2. Detection pipeline
-
-Two stages per class: a cheap regex finds candidates, a validator kills false positives.
-The validator is what makes this usable — regex alone on credit cards and generic secrets is unbearably noisy.
+## 2. System overview
 
 ```mermaid
-flowchart TD
-    IN["Raw text + source metadata"] --> FAN{"Fan out to all<br/>registered detectors"}
+flowchart TB
+    SF[("secrets.txt<br/>user-editable<br/>survives updates")]
 
-    FAN --> G1["Global classes"]
-    FAN --> G2["Secrets / credentials"]
-
-    subgraph GLOBAL["Global standard"]
-        G1 --> E1["EMAIL — RFC-lite regex"] --> EV1["domain not in allowlist"]
-        G1 --> E2["PHONE — E.164 + loose"] --> EV2["length + country prefix<br/>reject 555-01xx"]
-        G1 --> E3["CREDIT_CARD — 13-19 digits"] --> EV3["Luhn + IIN range"]
-        G1 --> E4["IP_ADDRESS — v4 / v6"] --> EV4["reject loopback, RFC1918, 0.0.0.0"]
-        G1 --> E5["DOB — common date formats"] --> EV5["plausible year range"]
+    subgraph EVENTS["Three interception points"]
+        E1["UserPromptSubmit<br/>your prompt"]
+        E2["PostToolUse<br/>tool output"]
+        E3["PreToolUse<br/>file writes"]
     end
 
-    subgraph SECRETS["Secrets / credentials"]
-        G2 --> K1["ANTHROPIC_KEY — sk-ant prefix"] --> KV1["length check"]
-        G2 --> K2["AWS_ACCESS_KEY — AKIA + 16"] --> KV2["paired secret via Shannon entropy"]
-        G2 --> K3["GITHUB_TOKEN — ghp/gho/ghu/ghs/ghr"] --> KV3["length check"]
-        G2 --> K4["JWT — eyJ + two dots"] --> KV4["base64 header decodes to JSON"]
-        G2 --> K5["PRIVATE_KEY — PEM BEGIN block"] --> KV5["matching END block"]
-        G2 --> K6["DB_URI — scheme user pass host"] --> KV6["password group non-empty"]
-        G2 --> K7["GENERIC_SECRET — key/token/password assign"] --> KV7["entropy >= 3.5<br/>reject xxx, changeme, your-key"]
+    subgraph ENTRY["Entry"]
+        RUN["run.sh<br/>probes for python3"]
+        CLI["cli.py<br/>dispatch + fail-open"]
     end
 
-    EV1 --> SP["Candidate spans"]
-    EV2 --> SP
-    EV3 --> SP
-    EV4 --> SP
-    EV5 --> SP
-    KV1 --> SP
-    KV2 --> SP
-    KV3 --> SP
-    KV4 --> SP
-    KV5 --> SP
-    KV6 --> SP
-    KV7 --> SP
+    subgraph CORE["Detection core — reusable, no Claude Code specifics"]
+        POL["policy.py<br/>parses secrets.txt"]
+        DET["detectors.py<br/>pattern + validator table"]
+        VAL["validators.py<br/>kills false positives"]
+        SCN["scanner.py<br/>size and line caps"]
+        RES["resolve.py<br/>overlap resolution"]
+    end
 
-    SP --> AL["Allowlist filter<br/>literals + patterns + own email"]
-    AL --> OV["Overlap resolution<br/>longest match wins, then priority"]
-    OV --> PL{"Policy lookup<br/>per entity class"}
+    subgraph ACT["Action"]
+        RDC["redact.py<br/>substitute placeholders"]
+        WLK["walk.py<br/>structure-preserving rewrite"]
+        AUD["audit.py<br/>HMAC log"]
+    end
 
-    PL -->|redact| RD["Replace with placeholder<br/>record in vault"]
-    PL -->|warn| WN["Leave text intact<br/>emit audit line"]
-    PL -->|allow| PS["Pass through untouched"]
-
-    RD --> AUDIT[("audit.jsonl")]
-    WN --> AUDIT
-    RD --> RET["ScanResult<br/>text + spans + vault handle"]
-    WN --> RET
-    PS --> RET
+    E1 --> RUN
+    E2 --> RUN
+    E3 --> RUN
+    RUN --> CLI
+    CLI --> POL
+    SF --> POL
+    POL --> SCN
+    DET --> SCN
+    VAL --> DET
+    SCN --> RES
+    RES --> RDC
+    RDC --> WLK
+    RES --> AUD
+    WLK --> OUT["JSON verdict to Claude Code"]
 ```
-
-### Detector table
-
-| Class | Pattern | Validator |
-|---|---|---|
-| `EMAIL` | RFC-lite | domain not in allowlist (`example.com`, `*.test`) |
-| `PHONE` | E.164 + loose | length + country prefix; reject `555-01xx` |
-| `CREDIT_CARD` | 13–19 digits, separators tolerated | **Luhn** + IIN range |
-| `IP_ADDRESS` | IPv4 / IPv6 | reject loopback / RFC1918 / `0.0.0.0` by default (configurable) |
-| `DOB` | common date formats | plausible year range |
-| `ANTHROPIC_KEY` | `sk-ant-*` | prefix + length |
-| `AWS_ACCESS_KEY` | `AKIA[0-9A-Z]{16}` | paired secret via Shannon entropy ≥ 3.5 |
-| `GITHUB_TOKEN` | `gh[pousr]_[A-Za-z0-9]{36}` | — |
-| `JWT` | `eyJ` + two dots | base64 header decodes to JSON |
-| `PRIVATE_KEY` | `-----BEGIN .* PRIVATE KEY-----` | matching END block |
-| `DB_URI` | `scheme://user:pass@host` | password group non-empty |
-| `GENERIC_SECRET` | `(api[_-]?key\|secret\|token\|password)\s*[:=]\s*['"]?(\S{20,})` | entropy ≥ 3.5, not a known placeholder |
-
-Street addresses and full names are **out of scope** with regex-only — see §8.
 
 ---
 
-## 3. Policy and the restore gate
+## 3. The secrets file
 
-`action` and `restore` are separate axes. That separation is the point: you want the placeholder
-swapped back for an email address, and you never want a live AWS key written back into a file.
+One file is the whole configuration surface. Parsed on every invocation, so edits take effect on
+the next prompt with no restart.
 
 ```mermaid
 flowchart LR
-    SPAN["Resolved span<br/>entity = CREDIT_CARD"] --> LOOK{"policy.entities<br/>lookup"}
-    LOOK -->|miss| DEF["default_action"]
-    LOOK -->|hit| ACT{"action"}
-    DEF --> ACT
+    F["secrets.txt"] --> P{"line type"}
+    P -->|"bare word<br/>aws_key"| C["enable a built-in detector"]
+    P -->|"quoted<br/>&quot;acme-internal.corp&quot;"| L["literal string match"]
+    P -->|"slashes<br/>/EMP-digits/"| R["user regex"]
+    P -->|"# comment"| S["skipped"]
 
-    ACT -->|warn| W["text unchanged<br/>audit line written"]
-    ACT -->|allow| A["text unchanged<br/>no audit line"]
-    ACT -->|redact| R["substitute placeholder<br/>double-bracket TYPE_N"]
-
-    R --> VQ{"restore flag"}
-    VQ -->|true| V1["store original in vault<br/>outbound restore allowed"]
-    VQ -->|false| V2["discard original<br/>placeholder is permanent"]
-
-    V1 --> OUTB["On response: swap back"]
-    V2 --> OUTB2["On response: leave as placeholder<br/>secret never re-enters the transcript"]
+    C --> SET["active detector set"]
+    L --> SET
+    R --> SET
+    SET --> SCAN["scanner"]
 ```
 
-```yaml
-# piiguard.yaml
-default_action: warn          # Phase 3 starts here
-entities:
-  EMAIL:           {action: redact, restore: true}
-  PHONE:           {action: redact, restore: true}
-  CREDIT_CARD:     {action: redact, restore: false}
-  DOB:             {action: redact, restore: true}
-  IP_ADDRESS:      {action: warn}
-  ANTHROPIC_KEY:   {action: redact, restore: false}
-  AWS_ACCESS_KEY:  {action: redact, restore: false}
-  GITHUB_TOKEN:    {action: redact, restore: false}
-  JWT:             {action: redact, restore: false}
-  PRIVATE_KEY:     {action: redact, restore: false}
-  DB_URI:          {action: redact, restore: false}
-  GENERIC_SECRET:  {action: redact, restore: false}
-allowlist:
-  literals:
-    - "swinal@caizin.com"
-    - "4111111111111111"
-  patterns:
-    - "example\\.com$"
-```
-
-**Placeholder format `[[EMAIL_1]]`** — low collision with real text, survives tokenization intact,
-and numbering is stable within a session so the model can co-refer across turns
-("email the first address").
+Shipped defaults enable credential classes only. Personal-data classes (`email`, `phone`,
+`ip_address`, `dob`) are present but commented out — in a coding context they fire constantly on
+`git log`, `CODEOWNERS`, `127.0.0.1`, and dates in changelogs. Uncommenting is a deliberate act.
 
 ---
 
-## 4. Adapter A — Claude Code hooks
+## 4. Flow A — your prompt (block only)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor U as User
+    actor U as You
     participant CC as Claude Code
-    participant H as piiguard hook
-    participant V as Vault + Audit
-    participant API as Claude API
+    participant H as piiguard
+    participant A as Anthropic API
 
-    U->>CC: types a prompt
-    CC->>H: UserPromptSubmit, JSON on stdin
-    H->>H: scan + redact prompt
-    H->>V: store originals, write audit line
-    H-->>CC: rewritten prompt on stdout
-    CC->>API: request with placeholders only
-    API-->>CC: assistant turn, wants a tool
+    U->>CC: submit prompt
+    CC->>H: UserPromptSubmit + prompt text
+    H->>H: scan against secrets.txt
 
-    rect rgb(245, 235, 220)
-    note over CC,H: Outbound guard
-    CC->>H: PreToolUse for Bash / Write / Edit
-    H->>H: scan tool_input for secrets
-    alt secret found and action is redact
-        H-->>CC: rewritten tool_input
-    else warn only
-        H->>V: audit line
-        H-->>CC: unchanged, allow
+    alt nothing found
+        H-->>CC: exit 0, silent
+        CC->>A: prompt sent unchanged
+        A-->>U: answer
+    else match found
+        H->>H: write HMAC audit line
+        H-->>CC: decision block + reason
+        CC-->>U: blocked, shows what matched
+        note over U: nothing was sent<br/>edit and resend
     end
-    end
-
-    CC->>CC: run the tool
-
-    rect rgb(225, 240, 235)
-    note over CC,H: Inbound guard — highest value
-    CC->>H: PostToolUse for Read / Grep / Bash
-    H->>H: scan tool output
-    note right of H: a single cat .env would<br/>dump the whole credential set<br/>into context
-    H->>V: audit line
-    H-->>CC: redacted tool output
-    end
-
-    CC->>API: tool_result with placeholders
-    API-->>CC: final answer
-    CC-->>U: answer
 ```
 
-| Hook | Surface guarded | Why |
+**The hook cannot clean a prompt.** Claude Code exposes no field for rewriting prompt text — only
+for blocking it. Verified directly against the application. So for typed input this is necessarily
+all-or-nothing.
+
+---
+
+## 5. Flow B — tool output (cleaned)
+
+Where redaction genuinely works. The tool runs normally; only what reaches the model is altered.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CC as Claude Code
+    participant T as Tool
+    participant H as piiguard
+    participant M as Model
+
+    CC->>T: Read .env
+    T-->>CC: tool_response with real values
+    CC->>H: PostToolUse + tool_response
+    H->>H: deep walk, scan string leaves
+
+    alt no secrets
+        H-->>CC: exit 0, silent
+        CC->>M: original output
+    else secrets found
+        H->>H: clone structure, substitute values
+        H->>H: HMAC audit line
+        H-->>CC: updatedToolOutput + additionalContext
+        CC->>CC: validate against tool output schema
+        CC->>M: cleaned output
+        note over M: sees AWS_ACCESS_KEY_ID<br/>but not its value
+    end
+```
+
+Two details that decide whether this works at all:
+
+- The stdin field is **`tool_response`**, not `tool_output`. Reading the wrong key finds nothing and
+  silently passes every secret through — a failure indistinguishable from "clean".
+- The replacement is **schema-validated per tool**. Only string leaves may change; keys and types
+  must survive, or the rewrite is discarded and the original output is used.
+
+---
+
+## 6. Flow C — writes to disk (ask)
+
+```mermaid
+flowchart LR
+    W["Claude wants to<br/>Write or Edit"] --> S["scan content"]
+    S -->|clean| A["proceed"]
+    S -->|credential found| ASK["permissionDecision: ask<br/>names the class"]
+    ASK --> U{"your call"}
+    U -->|approve| A
+    U -->|reject| N["not written"]
+```
+
+`ask`, never `deny`. A denial is unappealable inside the turn — the model re-plans around it, often
+worse, and you cannot consent without editing config. Writing a real key into `.env` is a
+legitimate act.
+
+---
+
+## 7. Detection pipeline
+
+Two stages per class: a cheap anchored regex finds candidates, a validator kills false positives.
+The validator is what makes this usable rather than infuriating.
+
+```mermaid
+flowchart TD
+    IN["text"] --> CAP{"size caps"}
+    CAP -->|"over 1 MB"| ANCH["anchored patterns only"]
+    CAP -->|normal| ALL["all enabled patterns"]
+    ANCH --> M["candidate matches"]
+    ALL --> M
+
+    M --> V{"validator"}
+    V -->|"CREDIT_CARD"| V1["Luhn + card prefix<br/>minus known test numbers"]
+    V -->|"JWT"| V2["header base64-decodes to JSON"]
+    V -->|"DB_URI"| V3["password real, not a placeholder"]
+    V -->|"AWS secret"| V4["Shannon entropy >= 3.5"]
+    V -->|"IP_ADDRESS"| V5["public only, skip loopback and RFC1918"]
+    V -->|"EMAIL"| V6["domain not example.com or .test"]
+
+    V1 --> K{"passed?"}
+    V2 --> K
+    V3 --> K
+    V4 --> K
+    V5 --> K
+    V6 --> K
+    K -->|no| DROP["discarded"]
+    K -->|yes| SP["span kept"]
+
+    SP --> OV["overlap resolution<br/>longest match wins"]
+    OV --> ACT["action by event"]
+```
+
+Worked example — scanning `postgres://admin:hunter2@db.prod:5432/app`:
+
+| Candidate | Detector | Verdict |
 |---|---|---|
-| `UserPromptSubmit` | the prompt | catches PII before it leaves the machine |
-| `PreToolUse` | `Bash`, `Write`, `Edit` inputs | catches secrets heading outbound into a command or file |
-| `PostToolUse` | `Read`, `Grep`, `Bash` output | **highest value** — stops file/command output from poisoning context |
+| `postgres://admin:hunter2@…` | `DB_URI` | password real → **keep** |
+| `5432` | `CREDIT_CARD` | too short → **discard** |
 
-### Two things to handle here
+Without the validator, that port number becomes a false positive on every connection string in the
+codebase.
 
-```mermaid
-flowchart LR
-    subgraph RISK1["Risk: hook JSON contract"]
-        A1["Confirm current stdin/stdout schema<br/>against live docs"] --> A2["hookSpecificOutput shape,<br/>exit-code semantics,<br/>can UserPromptSubmit rewrite or only block"]
-        A2 --> A3["Then write the adapter"]
-    end
+### ReDoS bounds
 
-    subgraph RISK2["Risk: latency"]
-        B1["Hooks fire on every prompt<br/>and every tool call"] --> B2["Python cold start 80-150ms"]
-        B2 --> B3["Module-level precompiled regex<br/>+ lazy imports"]
-        B3 --> B4{"p95 under 50ms?"}
-        B4 -->|yes| B5["Ship it"]
-        B4 -->|no| B6["Persistent daemon over<br/>unix socket + thin client"]
-    end
-```
+Python's `re` has **no timeout**, so a pathological input would hang for the whole hook timeout.
 
-Verify the hook schema **before** writing the adapter rather than working from memory — this API has moved.
-The latency budget is **p95 < 50 ms**, measured, not assumed.
+| Guard | Value |
+|---|---|
+| Hook timeout | 5 s — not the 600 s default, which would freeze a session for ten minutes |
+| Input cap | 1 MB, above which only anchored patterns run |
+| Line cap | 4 KB — minified bundles and base64 blobs are where backtracking lives |
 
 ---
 
-## 5. Adapter B — API middleware
-
-`GuardedAnthropic` mirrors the SDK surface so it drops in for `client.messages.create` / `.stream`.
-Default model `claude-opus-5`.
+## 8. Redaction mechanics
 
 ```mermaid
 flowchart TB
-    APP["Your app"] --> GC["GuardedAnthropic.messages.create / .stream"]
+    R["tool_response object"] --> W["deep walk"]
+    W --> T{"leaf type"}
+    T -->|string| SC["scan and substitute"]
+    T -->|"int, bool, null"| KEEP["untouched"]
+    T -->|"dict, list"| REC["recurse"]
+    REC --> T
 
-    subgraph INB["Inbound"]
-        GC --> W["Walk every text-bearing field"]
-        W --> W1["system"]
-        W --> W2["messages[].content text blocks"]
-        W --> W3["tool_result blocks"]
-        W --> W4["document titles"]
-        W1 --> SC["core.scan + redact"]
-        W2 --> SC
-        W3 --> SC
-        W4 --> SC
-        SC --> VH["Vault retained<br/>for this request"]
-    end
-
-    SC --> SDK["anthropic SDK<br/>messages.create / messages.stream"]
-    SDK --> ANT["Claude API"]
-    ANT --> RESP{"streaming?"}
-
-    RESP -->|no| NB["Buffered path"]
-    RESP -->|yes| ST["Streaming path"]
-
-    subgraph OUTB["Outbound — buffered"]
-        NB --> NB1["restore placeholders where restore = true"]
-        NB1 --> NB2["re-scan output for PII<br/>NOT present in the input"]
-        NB2 --> NB3["leak detection audit line"]
-    end
-
-    subgraph OUTS["Outbound — streamed"]
-        ST --> ST1["tail-window buffer<br/>state machine"]
-        ST1 --> ST2["get_final_message for<br/>the completed turn"]
-        ST2 --> NB2
-    end
-
-    NB3 --> APP2["Clean response to app"]
+    SC --> ORD["apply spans right to left"]
+    ORD --> WHY["so earlier offsets stay valid"]
+    ORD --> FIX["recompute numLines if content changed"]
+    FIX --> CH{"bytes actually changed?"}
+    CH -->|yes| EMIT["emit updatedToolOutput"]
+    CH -->|no| SKIP["emit nothing"]
 ```
 
-Leak detection is free once the scanner exists: anything PII-shaped in the output that was
-**not** in the input means the model produced it, and that is worth a log line.
+**Never emit an unchanged rewrite.** Tool-output hooks run in parallel and the last write wins, so
+returning an identity copy can clobber another plugin's real redaction.
 
-### The streaming state machine
-
-The one genuinely tricky piece. A placeholder can split across chunks — `[[EMA` then `IL_1]]` —
-so naive per-chunk restore silently corrupts output. This is the **#1 bug** in systems like this,
-and it gets its own test suite.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Passthrough
-
-    Passthrough: Passthrough
-    Passthrough: yield chunks straight through
-    Buffering: Buffering
-    Buffering: hold a tail window of max placeholder length
-    Resolve: Resolve
-    Resolve: complete placeholder recognised
-
-    Passthrough --> Buffering: sees a candidate opening delimiter
-    Buffering --> Buffering: still partial, keep holding
-    Buffering --> Passthrough: cannot become a placeholder, flush held text verbatim
-    Buffering --> Resolve: full placeholder token assembled
-    Resolve --> Passthrough: restore = true, emit original
-    Resolve --> Passthrough: restore = false, emit placeholder unchanged
-    Passthrough --> [*]: stream ends, flush remaining tail
-    Buffering --> [*]: stream ends mid-token, flush held text verbatim
-```
-
-Built on `client.messages.stream()` + `get_final_message()` — no hand-rolled event plumbing.
+Multi-line PEM blocks preserve their line count — the body is replaced with one placeholder line
+plus blanks — so sibling metadata fields stay consistent.
 
 ---
 
-## 6. Data model, vault and audit
-
-```mermaid
-classDiagram
-    class Span {
-        +int start
-        +int end
-        +str entity_type
-        +str text
-        +float confidence
-        +str detector
-    }
-    class ScanResult {
-        +str text
-        +list~Span~ spans
-        +VaultHandle vault
-        +bool modified
-    }
-    class Detector {
-        <<protocol>>
-        +str entity_type
-        +int priority
-        +scan(text) Iterable~Span~
-    }
-    class Vault {
-        -dict placeholder_to_original
-        +str session_id
-        +mint(span) str
-        +restore(text) str
-        +clear() None
-    }
-    class Policy {
-        +Action default_action
-        +dict entities
-        +Allowlist allowlist
-        +resolve(entity_type) EntityPolicy
-    }
-    class AuditRecord {
-        +str ts
-        +str surface
-        +str entity_type
-        +str detector
-        +int offset
-        +str sha12
-        +str action
-        +str session_id
-    }
-
-    Detector ..> Span : produces
-    ScanResult o-- Span
-    ScanResult o-- Vault
-    Policy ..> AuditRecord : decides action for
-    Vault ..> AuditRecord : never stores plaintext in
-```
-
-### The audit rule
+## 9. Audit log
 
 ```mermaid
 flowchart LR
-    ORIG["Original value<br/>4111 1111 1111 1111"] --> HASH["sha256 then take 12 chars"]
-    HASH --> LINE["audit.jsonl line<br/>sha12 = a94a8fe5ccb1"]
-    ORIG -.->|NEVER| LINE
-
-    LINE --> USE1["Count detections per class"]
-    LINE --> USE2["Count DISTINCT values<br/>hash prefix is enough"]
-    LINE --> USE3["Decide Phase 5 flips"]
+    V["AKIAIOSFODNN7EXAMPLE"] --> H["HMAC-SHA256<br/>key = per-install random salt"]
+    H --> ID["id = 9f2ac41b7e05"]
+    V -.->|NEVER written| LOG[("audit.jsonl")]
+    ID --> LOG
+    LOG --> U1["count events per class"]
+    LOG --> U2["count distinct values"]
 ```
 
-Plaintext never reaches the log. Otherwise your PII guardrail becomes your largest PII store.
-The hash prefix still lets you count distinct values during the warn-only soak.
+Plain `sha256(value)[:12]` would be **brute-forceable** for exactly the classes that matter — a DOB
+space is about 4×10⁴, a Luhn-valid card space about 10¹⁵. That would make the guardrail's own log a
+crackable store of the data it exists to protect. HMAC with a local secret keeps distinct-value
+counting and kills the dictionary attack.
+
+Only acted-on events are logged; a log full of `127.0.0.1` trains you to ignore it.
 
 ---
 
-## 7. Testing strategy
+## 10. Failure behaviour
+
+```mermaid
+flowchart TD
+    S["hook invoked"] --> P{"python3 present?"}
+    P -->|no| Q["exit 0 silently<br/>warn once per install"]
+    P -->|yes| R["run scanner"]
+    R --> E{"exception?"}
+    E -->|no| N["normal verdict"]
+    E -->|yes| F["exit 0, empty stdout<br/>loud stderr warning"]
+
+    F --> W["NEVER exit 2 on an internal error"]
+    W --> X["exit 2 means block —<br/>a crash must not read as a deliberate deny"]
+```
+
+**Fail open, loudly.** The threat model is an accidental leak by a cooperative user; fail-closed
+only helps against an adversary who could simply not install the plugin. The blast radius is
+asymmetric — failing open leaks one secret into a transcript you already own, failing closed kills
+every tool call in the session. But a *silent* failure is worse than either, because it manufactures
+false confidence.
+
+---
+
+## 11. Testing
 
 ```mermaid
 flowchart TB
-    subgraph T1["Golden corpus"]
-        C1["tests/corpus/*.txt<br/>inline expectations<br/>EXPECT EMAIL at 10-25"] --> C2["P/R harness"]
-        C2 --> C3["precision + recall<br/>reported per entity class"]
-        C3 --> C4["Gate: no warn to redact flip<br/>without measured numbers"]
+    subgraph CORP["Golden corpus"]
+        A1["files with inline EXPECT markers"] --> A2["precision + recall per class"]
+        A2 --> A3["gate: no class ships default-on<br/>without measured numbers"]
     end
-
-    subgraph T2["Adversarial set"]
-        A1["PII split across lines"] --> A2["Run scanner"]
-        A3["spaced-out digits"] --> A2
-        A4["base64 encoded"] --> A2
-        A5["homoglyphs"] --> A2
-        A2 --> A6["Document the miss rate<br/>goal is honesty, not zero"]
+    subgraph SHAPE["Shape tests"]
+        B1["recorded tool_response fixtures"] --> B2["rewrite survives schema validation"]
     end
-
-    subgraph T3["Property tests"]
-        P1["restore(redact(x)) == x"] --> P4["hypothesis"]
-        P2["never crashes on any input"] --> P4
-        P3["never drops or reorders<br/>non-PII text"] --> P4
+    subgraph ADV["Adversarial"]
+        C1["split lines, spaced digits,<br/>base64, homoglyphs"] --> C2["document the miss rate"]
     end
-
-    subgraph T4["Streaming tests"]
-        S1["chunk boundary at every byte<br/>of every placeholder"] --> S2["output identical to<br/>buffered path"]
+    subgraph PROP["Properties"]
+        D1["never crashes"] --> D3["hypothesis-style"]
+        D2["never drops non-secret text"] --> D3
+    end
+    subgraph PERF["Performance"]
+        E1["1 MB adversarial input"] --> E2["completes inside the bound"]
+        E3["100 invocations"] --> E4["p95 under 25 ms"]
     end
 ```
 
+Every handler is a pure function of its payload, so the entire hook surface is testable from
+recorded JSON with no Claude Code running.
+
 ---
 
-## 8. Phasing
+## 12. Build order
 
 ```mermaid
 gantt
-    title Build order — Phase 3 soak is the part worth protecting
+    title Phase 0 first — it can invalidate later phases
     dateFormat YYYY-MM-DD
     axisFormat %b %d
-
+    section Verify
+    Phase 0  Canary probe + fixtures        :crit, p0, 2026-09-24, 1d
     section Core
-    Phase 0  Scaffold, types, policy loader, audit sink   :p0, 2026-09-17, 1d
-    Phase 1  Detectors, validators, allowlists, corpus    :p1, after p0, 2d
-    Phase 2  Redaction engine, vault, roundtrip props     :p2, after p1, 1d
-
-    section Adapters
-    Phase 3  Hooks adapter, deployed warn-only            :p3, after p2, 1d
-    Phase 3  Soak week, read the audit log               :crit, p3s, after p3, 7d
-    Phase 4  API middleware + streaming state machine     :p4, after p3, 2d
-
-    section Rollout
-    Phase 5  Flip per-entity to redact on measured data   :p5, after p3s, 1d
+    Phase 1  Detectors + validators + corpus :p1, after p0, 2d
+    Phase 2  Secrets file, policy, audit     :p2, after p1, 1d
+    section Surface
+    Phase 3  Three handlers                  :p3, after p2, 2d
+    Phase 4  Robustness + perf               :p4, after p3, 1d
+    Phase 5  Docs + release                  :p5, after p4, 1d
 ```
 
-| Phase | Work | Est. |
-|---|---|---|
-| 0 | Scaffold, `pyproject`, core types, policy loader, audit sink | 0.5 d |
-| 1 | Detectors + validators + allowlists + corpus, **with measured P/R** | 2 d |
-| 2 | Redaction engine + vault + roundtrip properties | 1 d |
-| 3 | Hooks adapter, deployed **warn-only** | 1 d + 1 wk soak |
-| 4 | API middleware incl. streaming state machine | 2 d |
-| 5 | Read the soak audit log, flip per-entity to `redact` where earned | 0.5 d |
-
-Turning on redaction before you've seen real hit rates is how you end up with a guardrail
-everyone disables. Phase 3's soak week is what prevents that.
-
-```mermaid
-flowchart LR
-    W["All entities: warn<br/>1 week soak"] --> READ["Read audit.jsonl"]
-    READ --> Q{"Per entity class"}
-    Q -->|"high hit rate,<br/>low false positives"| F1["flip to redact"]
-    Q -->|"noisy"| F2["tighten validator<br/>or extend allowlist"]
-    Q -->|"never fires"| F3["leave at warn<br/>or drop the detector"]
-    F2 --> W
-```
+Phase 0 confirms, against a live session, that the tool-output rewrite actually reaches the model
+and in which shape per tool. The oracle is the session transcript JSONL, not asking the model what
+it saw.
 
 ---
 
-## 9. Known limits — stated up front
+## 13. Known limits
 
 ```mermaid
 flowchart TB
-    subgraph IN_SCOPE["Caught well — high 90s recall"]
-        I1["Credit cards"]
-        I2["API keys and tokens"]
-        I3["Email addresses"]
-        I4["Private key blocks"]
-        I5["Connection strings"]
+    subgraph GOOD["Caught reliably"]
+        G1["API keys and tokens"]
+        G2["Private key blocks"]
+        G3["Connection strings"]
+        G4["Credit cards"]
     end
-
-    subgraph OUT_SCOPE["Not caught — regex cannot do this"]
-        O1["Full names"]
-        O2["Street addresses"]
-        O3["Contextual disclosure<br/>my daughter goes to<br/>St Xaviers school in Pune"]
+    subgraph BAD["Not caught — regex matches format, not meaning"]
+        B1["Full names"]
+        B2["Street addresses"]
+        B3["Contextual disclosure"]
     end
-
-    subgraph LATER["Buy the remaining recall later"]
-        L1["Presidio + spaCy NER"]
-        L2["Haiku classifier pass"]
+    subgraph STRUCT["Structural limits"]
+        S1["claude.ai and the API are unreachable"]
+        S2["prompts can be blocked, not cleaned"]
+        S3["cannot un-send earlier turns"]
+        S4["a competing rewrite hook can win<br/>last-write-wins and re-expose"]
     end
-
-    OUT_SCOPE -.->|"when the dependency<br/>is worth it"| LATER
-    LATER -.->|"implements Detector protocol,<br/>adapters unchanged"| DONE["No rewrite needed"]
 ```
 
-Realistic recall on free-form prose is **60–70%**. This is a meaningful reduction in accidental
-leakage, **not a compliance control**, and it should not be described as one internally.
+Realistic recall on free-form prose is **60–70%**; on structured credentials, much higher. This is
+harm reduction for a common accident, **not a compliance control**.

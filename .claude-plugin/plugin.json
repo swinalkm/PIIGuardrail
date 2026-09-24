@@ -1,0 +1,22 @@
+{
+  "name": "piiguard",
+  "displayName": "PII Guardrail",
+  "version": "0.2.0",
+  "description": "Blocks prompts containing protected data and redacts it from tool output before Claude sees it.",
+  "license": "MIT",
+  "keywords": ["security", "pii", "secrets", "privacy", "dlp"],
+  "userConfig": {
+    "MODE": {
+      "type": "string",
+      "title": "Mode",
+      "description": "guard = block and redact, detect = log only, off = inactive",
+      "default": "guard"
+    },
+    "AUDIT": {
+      "type": "string",
+      "title": "Audit log",
+      "description": "Write hashed detections to audit.jsonl (true/false)",
+      "default": "true"
+    }
+  }
+}

@@ -1,30 +1,43 @@
 # PII Guardrail
 
-**A credential filter for Claude Code.** It keeps API keys, tokens, and private keys out of the
-model's context when you read a file or run a command that contains them — without blocking the
-work.
+**Scans your prompt before it reaches Claude.** If it contains something from your secrets list,
+the prompt is blocked and you're told what was found. If it's clean, it goes through untouched.
 
-> **Status: in development.** The design and the platform contract are verified; the
-> implementation is not finished. Do not install this expecting it to protect you yet.
+> **Status: v0.2.0 — 17 detectors implemented.** Working end to end. Detection rates
+> are not yet formally measured; see [Limitations](#limitations--read-this).
 
 ```
-you:     "why is the DB connection failing?"
-claude:  reads .env
+you:  "email the report to carol@acme.io"
 
-         without this plugin  →  DATABASE_URL=postgres://admin:hunter2@db.prod:5432/app
-         with this plugin     →  DATABASE_URL=[[DB_URI_1]]
+      ⛔ PII Guardrail blocked this message
+         Found: EMAIL (1 occurrence)
+         Nothing was sent. Remove the value and send again.
+
+you:  "email the report to the address in contacts.csv"
+
+      ✅ sent
 ```
-
-Claude still sees that a `DATABASE_URL` exists and can still debug your connection. It just never
-sees `hunter2`.
 
 ---
 
-## Why
+## Where this works
 
-Reading `.env` files and running `env` is something you do with Claude constantly without thinking
-about it. Every time, live credentials land in a transcript that leaves your machine and may be
-cached or retained. This plugin makes that specific, extremely common event harmless.
+This is a **Claude Code plugin**. It protects Claude Code and nothing else.
+
+| Surface | Protected | Why |
+|---|---|---|
+| Claude Code — terminal | ✅ | Plugin hooks run locally before each prompt |
+| Claude Code — VS Code / JetBrains | ✅ | Same hooks |
+| Subagents & background tasks | ✅ | Hooks apply to them too |
+| **claude.ai web UI** | ❌ | No plugin system. Your prompt goes browser → Anthropic with nothing local in between |
+| **Claude Desktop / mobile** | ❌ | No plugin mechanism exists |
+| **Anthropic API / your own agents** | ❌ | Your code calls the API directly, bypassing Claude Code entirely |
+
+**Scope is deliberately limited to Claude Code.** Covering the other surfaces would mean separate
+products — a browser extension, an API proxy — and those are not planned. If you paste a secret
+into claude.ai, nothing here will stop you.
+
+---
 
 ## Install
 
@@ -33,175 +46,208 @@ cached or retained. This plugin makes that specific, extremely common event harm
 /plugin install piiguard@piiguard
 ```
 
-That's it. It works immediately with no configuration.
+Anyone who installs it gets the guardrail immediately, with no configuration.
 
-## Requirements
+**Requires:** Claude Code, and `python3` on your `PATH`. **No Python packages** — the scanner is
+stdlib-only. No pip, no lockfile, no supply-chain surface. You can audit the whole thing by
+reading one directory.
 
-- Claude Code
-- `python3` on your `PATH`
-
-**No Python packages.** The scanner is stdlib-only — no pip, no lockfile, no supply-chain surface.
-For a tool that runs on every prompt, that's a deliberate feature, and it means you can audit the
-entire thing by reading one directory.
-
-If `python3` is missing, the plugin disables itself silently and warns you once. It never breaks
-your session.
+If `python3` is missing, the plugin disables itself and warns you once. It never breaks a session.
 
 ---
 
-## How it works
+## The secrets file
 
-Three separate paths, and they have **different capabilities**. That difference is the most
-important thing to understand about this plugin.
+One file controls everything. It lives at `${CLAUDE_PLUGIN_DATA}/secrets.txt`, is created on first
+run, and **survives plugin updates**.
 
-### 1. Tool output — the main feature
+```sh
+# ── categories ────────────────────────────────
+email
 
-1. Claude runs a tool (`Read`, `Bash`, `Grep`). **It runs normally** — nothing is blocked.
-2. Before the result reaches the model, the plugin scans it.
-3. Credentials are replaced with labels: `AKIAIOSFODNN7EXAMPLE` → `[[AWS_ACCESS_KEY_1]]`.
-4. The model receives the cleaned version. Variable names survive; values don't.
+# ── literal values ────────────────────────────
+# Exact strings blocked wherever they appear.
+"acme-internal.corp"
 
-Redaction happens *after* execution, which is why `cat .env` still works normally for you.
+# ── custom patterns ───────────────────────────
+# Your own regex, between slashes.
+/EMP-[0-9]{6}/
 
-### 2. Prompts you type — block only
+# ── allowlist ─────────────────────────────────
+# Never flag anything containing these.
+!example.com
+```
+
+Four entry types:
+
+| Syntax | Meaning |
+|---|---|
+| `email` | Enable a built-in detector |
+| `"literal"` | Block this exact string, anywhere |
+| `/regex/` | Block anything matching your pattern |
+| `!text` | Allowlist — never flag anything containing this |
+
+Edit the file, and the next prompt uses it. No restart.
+
+### Built-in categories
+
+**On by default** — high confidence, because the format itself is the evidence:
+
+| Category | Matches |
+|---|---|
+| `aws_access_key` | `AKIA`/`ASIA`/`AROA`… + 16 chars |
+| `aws_secret_key` | 40-char secret in an `aws_secret_access_key=` assignment |
+| `github_token` | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` + 36 |
+| `anthropic_key` | `sk-ant-…` |
+| `openai_key` | `sk-…` / `sk-proj-…` |
+| `slack_token` | `xoxb-` / `xoxp-` / `xoxa-` / `xoxr-` / `xoxs-` |
+| `google_api_key` | `AIza` + 35 chars |
+| `stripe_key` | `sk_live_` / `sk_test_` / `rk_live_` / `rk_test_` |
+| `jwt` | Three-part token whose header **base64-decodes to JSON with an `alg`** |
+| `private_key` | PEM `BEGIN … PRIVATE KEY` blocks (line count preserved) |
+| `db_uri` | `scheme://user:password@host`, placeholder passwords ignored |
+| `email` | Email addresses |
+
+**Off by default** — correct, but noisy in a coding context. Uncomment in `secrets.txt`:
+
+| Category | Why it's off |
+|---|---|
+| `credit_card` | Luhn + issuer prefix, test cards excluded — but long numeric IDs can still collide |
+| `phone` | Version strings and numeric IDs resemble phone numbers |
+| `ip_address` | Public only (loopback, RFC1918, multicast skipped) — but CDN and cloud IPs in logs match |
+| `dob` | Any ISO or DD/MM/YYYY date — changelogs, migration filenames, fixtures |
+| `generic_secret` | `token = "..."` assignments — also matches git SHAs, lockfile hashes, UUIDs |
+
+### What the validators throw away
+
+Every pattern is paired with a check, which is what keeps this usable. Verified against real
+developer content — these are **not** flagged:
+
+```
+sha512-Xk29fLpQw81ZmRtVb04YnSeAqWc7Zx0PlmNbVv==     lockfile hash
+550e8400-e29b-41d4-a716-446655440000               UUID
+4242424242424242                                   test card
+127.0.0.1  192.168.1.5  10.96.0.1                  private IPs
+postgres://user:password@localhost:5432/db         placeholder password
+Authorization: Bearer YOUR_TOKEN_HERE              placeholder token
+5432  8080  1099511627776                          ports and numbers
+```
+
+**Known noise:** with `email` on, `git log`, `git blame`, `CODEOWNERS` and `package.json` author
+fields all get redacted in tool output. If that gets in your way, allowlist your team's domain
+(below) or comment out `email`.
+
+### Allowlisting
+
+Lines starting with `!` are never flagged. Useful for test domains and your own address:
+
+```sh
+email
+!example.com
+!noreply.github.com
+```
+
+---
+
+## What happens, step by step
+
+### Your prompt — blocked
 
 1. You submit a prompt.
-2. The plugin scans it before it is sent.
-3. If it contains a credential, **the prompt is blocked** and you're told why. Nothing is sent.
-4. You edit it and resend.
+2. The plugin scans it against your secrets file.
+3. **Nothing found** → sent normally. This is the common case.
+4. **Something found** → the prompt is **blocked** and you're shown what matched.
+5. You edit it and resend.
 
-**It cannot clean a prompt.** Claude Code has no mechanism for rewriting prompt text — only for
-blocking it. So for anything you type, it's all-or-nothing. See
-[Limitations](#limitations-read-this).
+⚠️ **It blocks; it cannot clean.** Claude Code has no mechanism for rewriting prompt text, only for
+stopping it. So for anything you type, it's all-or-nothing. This is a platform limit, not a design
+choice.
 
-### 3. Writes to disk — asks first
+### Tool output — cleaned
 
-If Claude is about to `Write` or `Edit` a file whose content contains a live credential, you get a
-permission prompt naming what was found. You approve or reject. The plugin never decides for you.
+When Claude reads a file or runs a command, the tool runs normally, then the plugin scans the
+result **before the model sees it** and swaps secrets for labels:
+
+```
+lead:  swinal@caizin.com      →    lead:  [[EMAIL_1]]
+dev:   bob@acme.io            →    dev:   [[EMAIL_2]]
+port   5432                   →    port   5432          (untouched)
+```
+
+Claude still sees the structure and can still do the work — it just never sees the values.
+Here the plugin **can** rewrite, unlike prompts.
+
+### Writing to disk — asks first
+
+If Claude is about to write a file containing protected data, you get a permission prompt naming
+what was found. You decide — it asks rather than denying, because writing your own address into a
+config file is a perfectly normal thing to do.
 
 ---
 
-## What it detects
+## Settings
 
-### On by default — Tier 1
-
-High-confidence formats where the structure itself is the evidence, so false positives are rare.
-
-| Class | What it matches |
-|---|---|
-| `AWS_ACCESS_KEY` | `AKIA` + 16 chars, plus paired secret keys by entropy |
-| `GITHUB_TOKEN` | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` + 36 chars |
-| `ANTHROPIC_KEY` | `sk-ant-…` |
-| `SLACK_TOKEN` | `xoxb-` / `xoxp-` / `xoxa-` / `xoxr-` / `xoxs-` |
-| `PRIVATE_KEY` | PEM `BEGIN … PRIVATE KEY` blocks |
-| `JWT` | Three-part tokens whose header actually decodes to JSON |
-| `DB_URI` | `scheme://user:password@host` with a real password |
-| `CREDIT_CARD` | 13–19 digits passing Luhn and a known IIN range |
-
-Well-known test card numbers (`4242…`, `4111…`) are **not** redacted — payment-integration work
-keeps working.
-
-### Off by default — Tier 2
-
-These are implemented but disabled, because in a coding context they are overwhelmingly false
-positives and redacting them breaks your work:
-
-| Class | Why it's off |
-|---|---|
-| `EMAIL` | `git log`, `git blame`, `CODEOWNERS`, `package.json`. Redact these and `git blame` becomes useless |
-| `IP_ADDRESS` | `127.0.0.1`, Docker bridges, k8s service CIDRs — almost never personal data |
-| `DOB` | Any `YYYY-MM-DD` in a changelog or migration filename |
-| `PHONE` | Version strings and IDs match readily |
-| `GENERIC_SECRET` | Matches git SHAs, lockfile hashes, UUIDs, minified JS, and every `token = "..."` in a test file |
-
-Enable them per-class if your work genuinely involves personal data:
-
-```json
-{ "classes": ["AWS_ACCESS_KEY", "PRIVATE_KEY", "EMAIL", "PHONE"] }
-```
-
----
-
-## Configuration
-
-Optional. Edit `${CLAUDE_PLUGIN_DATA}/policy.json` — it is seeded on first run and **survives
-plugin updates**.
-
-```json
-{
-  "mode": "guard",
-  "classes": ["AWS_ACCESS_KEY", "GITHUB_TOKEN", "ANTHROPIC_KEY",
-              "SLACK_TOKEN", "PRIVATE_KEY", "JWT", "DB_URI", "CREDIT_CARD"],
-  "audit": true
-}
-```
+`${CLAUDE_PLUGIN_DATA}/policy.json`, also update-safe:
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `mode` | `guard` | Redact, block, and ask. The default |
-| | `detect` | Never modify or block anything; only log. Good for a trial run |
+| `mode` | `guard` | Block, clean, and ask. Default |
+| | `detect` | Never block or modify — only log. Good for a trial week |
 | | `off` | Fully inert |
-| `classes` | list | Which detectors are active |
-| `audit` | bool | Write to the audit log |
+| `audit` | `true` / `false` | Write the log |
 
 ## The audit log
 
-`${CLAUDE_PLUGIN_DATA}/audit.jsonl`, one line per event:
+`${CLAUDE_PLUGIN_DATA}/audit.jsonl` — one line per event:
 
 ```json
-{"ts":"2026-09-16T10:04:21Z","event":"PostToolUse","tool":"Read",
- "action":"redact","hits":[{"class":"AWS_ACCESS_KEY","id":"9f2ac41b7e05"}]}
+{"ts":"2026-09-23T10:04:21Z","v":"0.1.0","event":"UserPromptSubmit","tool":null,
+ "action":"block","hits":[{"class":"EMAIL","id":"0a1cd0c7cbfb"}]}
 ```
 
-`id` is `HMAC-SHA256(per-install random salt, value)`, truncated. **The secret is never written to
-the log**, and a plain hash isn't used either — `sha256` of a card number or a date of birth is
-brute-forceable in seconds. The HMAC lets you count distinct values without creating a crackable
-store of the things you were trying to protect.
-
-Only events that were acted on are logged. A log full of `127.0.0.1` would train you to ignore it.
+`id` is `HMAC-SHA256(per-install random salt, value)`. **The secret is never written to disk**, and
+a plain hash isn't used either — `sha256` of a phone number or date of birth can be brute-forced in
+seconds. The HMAC lets you count distinct values without creating a crackable store of the very
+things you're protecting.
 
 ## Privacy
 
-Nothing is transmitted. No telemetry, no error reporting, no network calls of any kind. The policy
-file, the salt, and the audit log all stay in `${CLAUDE_PLUGIN_DATA}` on your machine. The author
-of this plugin receives nothing and can see nothing.
-
-The flip side: there's no feedback channel, so if it misses something, please open an issue.
+Nothing is transmitted. No telemetry, no error reporting, no network calls. Your secrets file, the
+salt, and the audit log stay on your machine. The author of this plugin receives nothing.
 
 ---
 
 ## Limitations — read this
 
-This is harm reduction for a common accident. It is **not** a security boundary.
+Harm reduction for a common accident. **Not a security boundary.**
 
-**It is not a compliance control.** Not GDPR, PCI-DSS, HIPAA, SOC 2, or DLP tooling. Do not
-represent it as one to an auditor.
+**Only Claude Code.** See [the table above](#where-this-works). Prompts typed into claude.ai are
+completely unprotected.
 
-**It does not protect what you type.** Prompts can only be blocked, not cleaned — Claude Code
-offers no mechanism to rewrite prompt text. Anything you paste is sent verbatim unless the whole
-message is blocked.
+**Prompts can only be blocked, not cleaned.** Platform limit.
 
-**It does not catch names, addresses, or contextual disclosure.** "My daughter goes to St Xaviers
-in Pune" is invisible to it. Detection is regex plus validators — it recognises *formats*, not
-meaning. Realistic recall on free-form prose is roughly **60–70%**; on structured credentials it is
-much higher.
+**It cannot un-send.** Only the current turn is filtered. Anything already in your transcript stays
+there, and transcript files on disk are not scrubbed.
 
-**It cannot un-send.** Only the current turn is filtered. Anything already in your transcript from
-earlier turns stays there, and existing transcript files on disk are not scrubbed.
+**It matches formats, not meaning.** "My daughter goes to St Xaviers in Pune" is invisible to it.
+Names, addresses, and contextual disclosure need a language model, not regex. Realistic recall on
+free-form prose is roughly **60–70%**; on structured credentials it's much higher.
 
-**Another plugin can silently defeat it.** `PostToolUse` hooks run in parallel and the last write
-wins. If you also run a hook that rewrites tool output — log compressors and output truncators are
-the common ones — it may overwrite this plugin's redaction, re-exposing the secret with no warning.
-This plugin never emits an unchanged rewrite, to avoid clobbering others in the same way.
+**Another plugin can silently defeat it.** Tool-output hooks run in parallel and the last write
+wins. If you also run a hook that rewrites tool output — log compressors, output truncators — it
+may overwrite this plugin's redaction with no warning.
 
-**It assumes a cooperative path.** It is not a defence against prompt injection, a malicious model,
-or deliberate exfiltration. Someone who wants to leak a secret can trivially do so.
+**It assumes a cooperative user.** Not a defence against prompt injection, a malicious model, or
+deliberate exfiltration.
 
-**It does not scan commits.** Use [gitleaks](https://github.com/gitleaks/gitleaks) or a pre-commit
-hook for that — different problem, better-solved elsewhere.
+**It is not a compliance control.** Not GDPR, PCI-DSS, HIPAA, SOC 2, or DLP. Don't represent it as
+one.
 
-**Detection rates are not yet measured.** Per-class precision and recall will be published here
-once the corpus harness runs. Until then, treat coverage as unproven.
+**It does not scan commits.** Use [gitleaks](https://github.com/gitleaks/gitleaks) — different
+problem, better solved elsewhere.
+
+**Detection rates are unmeasured.** Per-class precision and recall will be published here once the
+corpus harness runs. Until then, treat coverage as unproven.
 
 ---
 
@@ -210,35 +256,28 @@ once the corpus harness runs. Until then, treat coverage as unproven.
 ```bash
 git clone https://github.com/<your-github-username>/PIIGuardrail
 cd PIIGuardrail
-python3 -m unittest discover tests/          # no dependencies to install
+python3 -m unittest discover tests/        # nothing to install
 ```
 
-Test it against a local checkout before publishing:
+Test against a local checkout:
 
 ```
 /plugin marketplace add ./
 /plugin install piiguard@piiguard
 ```
 
-### Design notes
+**Design notes.** Fail open, loudly — an internal error exits cleanly and warns on stderr; a crash
+must never break a session, and must never be mistaken for a deliberate block. Rewrites preserve
+structure, since replacement tool output is schema-validated. Work is bounded: Python's `re` has no
+timeout, so oversized inputs fall back to anchored patterns and the hook has a hard 5s limit.
 
-- **Fail open, loudly.** Any internal error exits cleanly and warns on stderr. A crash must never
-  break someone's session, and it must never be mistaken for a deliberate block. A silently failing
-  security tool is worse than none — it manufactures false confidence.
-- **Rewrites preserve structure.** Replacement tool output is validated against each tool's schema,
-  so only string values are ever substituted; keys and types are untouched.
-- **Bounded work.** Python's `re` has no timeout, so inputs above 1 MB fall back to anchored
-  patterns only, long lines are skipped, and the hook has a hard 5-second timeout.
-
-Architecture and diagrams: [docs/WORKFLOW.md](docs/WORKFLOW.md).
+Architecture: [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Contributing
 
-Detectors are declarative — adding one is a pattern, a validator, and corpus entries. A new
-detector needs test cases covering both what it should catch and what it must *not*.
-
-The bar for Tier 1 is deliberately high: near-zero false positives on real codebases. When in
-doubt, propose it as Tier 2.
+Detectors are declarative — a pattern, a validator, and corpus entries. Every new detector needs
+test cases for what it must catch **and** what it must not. The bar for default-on is near-zero
+false positives on real codebases; when in doubt, ship it off by default.
 
 ## License
 
