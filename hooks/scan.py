@@ -727,7 +727,83 @@ HANDLERS = {
 
 # ------------------------------------------------------------------ main ----
 
+# ------------------------------------------------------------------ CLI ----
+# Invoked as `scan.py --on|--off|--detect|--status` from a terminal or the
+# /piiguard slash command. Hook events never pass these flags, and the check
+# happens before stdin is read so the CLI does not block waiting for input.
+
+_CLI_MODES = {"--on": "guard", "--off": "off", "--detect": "detect"}
+
+
+def _set_mode(mode):
+    d = _data_dir()
+    path = os.path.join(d, "policy.json")
+    try:
+        with open(path) as fh:
+            policy = json.load(fh)
+    except Exception:
+        policy = {"mode": "guard", "audit": True}
+    policy["mode"] = mode
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(policy, fh, indent=2)
+    except Exception as exc:
+        sys.stdout.write("Could not write %s: %s\n" % (path, exc))
+        return 1
+    return 0
+
+
+def _status(cfg):
+    labels = {"guard": "ON  (blocking and redacting)",
+              "detect": "DETECT (logging only, nothing blocked)",
+              "off": "OFF (inactive)"}
+    lines = ["PII Guardrail v%s" % VERSION,
+             "  status   : %s" % labels.get(cfg.mode, cfg.mode),
+             "  detectors: %d %s" % (len(cfg.classes),
+                                     "configured (not running)"
+                                     if cfg.mode == "off" else "active"),
+             "  config   : %s/secrets.txt" % _data_dir()]
+    if cfg.classes and cfg.mode != "off":
+        names = sorted(n.lower() for n in cfg.classes)
+        lines.append("  watching : %s" % ", ".join(names))
+    if cfg.allow:
+        lines.append("  allowed  : %s" % ", ".join(cfg.allow))
+    if cfg.warnings:
+        lines.append("  warnings : %s" % "; ".join(cfg.warnings[:3]))
+    audit_path = os.path.join(_data_dir(), "audit.jsonl")
+    try:
+        with open(audit_path) as fh:
+            lines.append("  detections logged: %d" % sum(1 for _ in fh))
+    except Exception:
+        lines.append("  detections logged: 0")
+    return "\n".join(lines)
+
+
+def cli(argv):
+    arg = argv[1]
+    if arg in _CLI_MODES:
+        mode = _CLI_MODES[arg]
+        rc = _set_mode(mode)
+        if rc == 0:
+            sys.stdout.write(_status(load_config()) + "\n")
+        return rc
+    if arg == "--status":
+        sys.stdout.write(_status(load_config()) + "\n")
+        return 0
+    sys.stdout.write(
+        "PII Guardrail v%s\n\n"
+        "  --on       enable (block and redact)\n"
+        "  --off      disable entirely\n"
+        "  --detect   log only, never block\n"
+        "  --status   show current state\n" % VERSION)
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+        return cli(sys.argv)
+
     raw = sys.stdin.read()
     if not raw.strip():
         return 0

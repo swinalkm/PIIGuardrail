@@ -41,20 +41,130 @@ into claude.ai, nothing here will stop you.
 
 ## Install
 
+**Requires:** Claude Code, and `python3` on your `PATH`.
+
+**No Python packages** — the scanner is stdlib-only. No pip, no lockfile, no
+supply-chain surface. The whole thing is one directory you can read before trusting it.
+
+If `python3` is missing, the plugin disables itself and warns you once. It never breaks
+a session.
+
+### From GitHub
+
+```bash
+claude plugin marketplace add <your-github-username>/PIIGuardrail
+claude plugin install piiguard@piiguard
+```
+
+Or inside Claude Code, as slash commands:
+
 ```
 /plugin marketplace add <your-github-username>/PIIGuardrail
 /plugin install piiguard@piiguard
 ```
 
-Anyone who installs it gets the guardrail immediately, with no configuration.
+**Both steps are required.** `install` can only resolve a marketplace that has already
+been added — running it alone gives `Marketplace "piiguard" not found`.
 
-**Requires:** Claude Code, and `python3` on your `PATH`. **No Python packages** — the scanner is
-stdlib-only. No pip, no lockfile, no supply-chain surface. You can audit the whole thing by
-reading one directory.
+**Restart Claude Code afterwards.** Hooks are loaded at session start.
 
-If `python3` is missing, the plugin disables itself and warns you once. It never breaks a session.
+### From a local clone
+
+```bash
+git clone https://github.com/<your-github-username>/PIIGuardrail.git
+cd PIIGuardrail
+claude plugin marketplace add "$PWD"
+claude plugin install piiguard@piiguard
+```
+
+### Verify
+
+```bash
+claude plugin list                    # should show piiguard@piiguard, enabled
+```
+
+Then restart Claude Code and send a message containing an email address. It should be
+blocked before it is sent.
+
+### Updating
+
+```bash
+cd PIIGuardrail && git pull
+claude plugin marketplace update piiguard
+```
+
+Your `secrets.txt`, audit log, and salt live outside the repo and are never touched by
+an update.
+
+### Uninstalling
+
+```bash
+claude plugin disable piiguard@piiguard      # stop it running, keep it installed
+claude plugin uninstall piiguard@piiguard    # remove the plugin
+claude plugin marketplace remove piiguard    # deregister the marketplace
+```
 
 ---
+
+## Turning it on and off
+
+Three levels, from quickest to most thorough.
+
+### 1. Toggle the guard — instant, no restart
+
+```
+/piiguard off        # stop blocking and redacting
+/piiguard on         # resume
+/piiguard detect     # log detections but never block
+/piiguard status     # what is it doing right now
+```
+
+Or from a terminal:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --off
+"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" --status
+```
+
+```
+PII Guardrail v0.2.0
+  status   : ON  (blocking and redacting)
+  detectors: 12 active
+  config   : /Users/you/.../piiguard/secrets.txt
+  watching : anthropic_key, aws_access_key, db_uri, email, github_token, ...
+  detections logged: 14
+```
+
+The hook re-reads config on every invocation, so the change applies to your very next
+prompt.
+
+**`detect` is the useful middle setting** — it records everything it *would* have
+caught without ever interrupting you. Run it for a week, read the audit log, then
+decide whether to switch on.
+
+### 2. Turn off one category
+
+Comment out a line in `${CLAUDE_PLUGIN_DATA}/secrets.txt`:
+
+```sh
+aws_access_key
+# email          ← now ignored
+```
+
+### 3. Disable the plugin entirely
+
+```bash
+claude plugin disable piiguard@piiguard      # needs a restart
+```
+
+| | Effect | Restart? |
+|---|---|---|
+| `/piiguard off` | Hook runs, does nothing | No |
+| Comment out a line | That one category stops | No |
+| `plugin disable` | Hook never runs | Yes |
+
+---
+
 
 ## The secrets file
 
