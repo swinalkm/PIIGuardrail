@@ -52,16 +52,20 @@ a session.
 ### From GitHub
 
 ```bash
-claude plugin marketplace add <your-github-username>/PIIGuardrail
+claude plugin marketplace add https://github.com/swinalkm/PIIGuardrail.git
 claude plugin install piiguard@piiguard
 ```
 
-Or inside Claude Code, as slash commands:
+Inside the Claude Code **terminal** you can use the slash-command equivalents:
 
 ```
-/plugin marketplace add <your-github-username>/PIIGuardrail
+/plugin marketplace add https://github.com/swinalkm/PIIGuardrail.git
 /plugin install piiguard@piiguard
 ```
+
+> `/plugin` is only available in the terminal. In the VS Code and JetBrains
+> extensions it returns *"`/plugin` isn't available in this environment"* — use the
+> `claude plugin ...` commands above from any shell instead. They do the same thing.
 
 **Both steps are required.** `install` can only resolve a marketplace that has already
 been added — running it alone gives `Marketplace "piiguard" not found`.
@@ -71,7 +75,7 @@ been added — running it alone gives `Marketplace "piiguard" not found`.
 ### From a local clone
 
 ```bash
-git clone https://github.com/<your-github-username>/PIIGuardrail.git
+git clone https://github.com/swinalkm/PIIGuardrail.git
 cd PIIGuardrail
 claude plugin marketplace add "$PWD"
 claude plugin install piiguard@piiguard
@@ -364,17 +368,29 @@ corpus harness runs. Until then, treat coverage as unproven.
 ## Development
 
 ```bash
-git clone https://github.com/<your-github-username>/PIIGuardrail
+git clone https://github.com/swinalkm/PIIGuardrail.git
 cd PIIGuardrail
-python3 -m unittest discover tests/        # nothing to install
 ```
 
-Test against a local checkout:
+Install your working copy so edits are live — the marketplace points at the directory,
+so changing `hooks/scan.py` takes effect on the next session with no reinstall:
 
+```bash
+claude plugin marketplace add "$PWD"
+claude plugin install piiguard@piiguard
 ```
-/plugin marketplace add ./
-/plugin install piiguard@piiguard
+
+Exercise a hook directly, without installing anything:
+
+```bash
+export CLAUDE_PLUGIN_ROOT="$PWD"
+export CLAUDE_PLUGIN_DATA=/tmp/pg-dev
+
+echo '{"hook_event_name":"SessionStart"}' | ./hooks/run.sh
+echo '{"hook_event_name":"UserPromptSubmit","prompt":"key AKIAIOSFODNN7EXAMPLE"}' | ./hooks/run.sh
 ```
+
+Empty output means allowed; JSON with `"decision":"block"` means blocked.
 
 **Design notes.** Fail open, loudly — an internal error exits cleanly and warns on stderr; a crash
 must never break a session, and must never be mistaken for a deliberate block. Rewrites preserve
