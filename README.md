@@ -169,7 +169,7 @@ When Claude reads a file or runs a command, the tool runs normally, then the plu
 result **before the model sees it** and swaps secrets for labels:
 
 ```
-lead:  swinal@caizin.com      →    lead:  [[EMAIL_1]]
+lead:  swinalkm@gmail.com     →    lead:  [[EMAIL_1]]
 dev:   bob@acme.io            →    dev:   [[EMAIL_2]]
 port   5432                   →    port   5432          (untouched)
 ```
